@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""
+sshduo - Quick SSH with automatic Duo SMS authentication for MIT servers.
+"""
+
+import sqlite3
+import re
+import time
+import sys
+import json
+import argparse
+import pexpect
+from pathlib import Path
+
+# Configuration
+CONFIG_PATH = Path.home() / ".sshduo.json"
+MESSAGES_DB = Path.home() / "Library/Messages/chat.db"
+DUO_PATTERN = re.compile(r'SMS passcodes.*?:\s*(\d{6,8})', re.IGNORECASE)
+
+# Server shortcuts
+SERVERS = {
+    "athena": "athena.dialup.mit.edu",
+    "orcd": "orcd-login.mit.edu",
+}
+
+
+def load_config() -> dict:
+    """Load config from ~/.sshduo.json"""
+    if CONFIG_PATH.exists():
+        return json.loads(CONFIG_PATH.read_text())
+    return {}
+
+
+def save_config(config: dict):
+    """Save config to ~/.sshduo.json"""
+    CONFIG_PATH.write_text(json.dumps(config, indent=2))
+    CONFIG_PATH.chmod(0o600)  # Only user can read
+    print(f"✅ Config saved to {CONFIG_PATH}")
+
+
+def configure():
+    """Interactive configuration."""
+    config = load_config()
+    print("🔧 sshduo Configuration\n")
+    
+    username = input(f"Username [{config.get('username', '')}]: ").strip()
+    if username:
+        config['username'] = username
+    
+    password = input("Password (leave blank to keep current): ").strip()
+    if password:
+        config['password'] = password
+    
+    save_config(config)
+
+
+def get_duo_code(timeout: int = 60) -> str | None:
+    """Wait for Duo SMS code from iMessage."""
+    start = time.time()
+    check_after = start - 5
+    
+    print(f"⏳ Waiting for Duo SMS ({timeout}s timeout)...")
+    
+    while time.time() - start < timeout:
+        try:
+            conn = sqlite3.connect(f"file:{MESSAGES_DB}?mode=ro", uri=True)
+            rows = conn.execute("""
+                SELECT text, date/1000000000 + 978307200 as ts
+                FROM message WHERE text IS NOT NULL
+                ORDER BY date DESC LIMIT 20
+            """).fetchall()
+            conn.close()
+            
+            for text, ts in rows:
+                if ts < check_after or not text:
+                    continue
+                match = DUO_PATTERN.search(text)
+                if match:
+                    code = match.group(1)
+                    print(f"✅ Got code: {code}")
+                    return code
+        except Exception:
+            pass
+        time.sleep(1)
+    
+    print("❌ Timeout waiting for SMS")
+    return None
+
+
+def ssh_duo(host: str, username: str, password: str):
+    """SSH with automatic Duo SMS authentication."""
+    print(f"\n🔐 Connecting to {username}@{host}...")
+    
+    child = pexpect.spawn(f"ssh {username}@{host}", encoding='utf-8', timeout=60)
+    child.logfile_read = sys.stdout
+    
+    # Handle host key + password
+    idx = child.expect([r"[Pp]assword:", r"continue connecting", pexpect.TIMEOUT], timeout=30)
+    if idx == 1:
+        child.sendline("yes")
+        child.expect(r"[Pp]assword:")
+    elif idx == 2:
+        print("❌ Connection timeout")
+        return
+    
+    child.sendline(password)
+    
+    # Wait for Duo menu
+    idx = child.expect([r"\(1-3\):", r"Permission denied", pexpect.TIMEOUT], timeout=30)
+    if idx != 0:
+        print("❌ Password rejected or timeout")
+        return
+    
+    # Select SMS option
+    print("\n📱 Requesting SMS code...")
+    child.sendline("3")
+    
+    # Wait for SMS confirmation, retry if needed
+    idx = child.expect([r"[Nn]ew.*codes", r"codes sent", r"\(1-3\):"], timeout=20)
+    if idx == 2:
+        child.sendline("3")
+        child.expect([r"[Nn]ew.*codes", r"codes sent"], timeout=20)
+    
+    # Wait for input prompt
+    try:
+        child.expect(r"\(1-3\):", timeout=10)
+    except pexpect.TIMEOUT:
+        pass
+    
+    # Get and enter code
+    code = get_duo_code()
+    if not code:
+        print("❌ No code received. Manual auth needed.")
+        child.logfile_read = None
+        child.interact()
+        return
+    
+    child.sendline(code)
+    
+    # Wait for success
+    idx = child.expect([r"Success|Welcome|Last login|\$|%|#", r"\(1-3\):"], timeout=30)
+    if idx == 1:
+        print("❌ Code rejected")
+        child.logfile_read = None
+        child.interact()
+        return
+    
+    print("\n✅ Connected!")
+    print("-" * 50)
+    child.logfile_read = None
+    child.interact()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="sshduo",
+        description="Quick SSH with automatic Duo SMS authentication",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  sshduo -a          Connect to Athena
+  sshduo -o          Connect to ORCD
+  sshduo --config    Set username and password
+"""
+    )
+    
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("-a", "--athena", action="store_true", help="Connect to athena.dialup.mit.edu")
+    group.add_argument("-o", "--orcd", action="store_true", help="Connect to orcd-login.mit.edu")
+    group.add_argument("--config", action="store_true", help="Configure username and password")
+    group.add_argument("host", nargs="?", help="Custom hostname")
+    
+    args = parser.parse_args()
+    
+    if args.config:
+        configure()
+        return
+    
+    # Determine host
+    if args.athena:
+        host = SERVERS["athena"]
+    elif args.orcd:
+        host = SERVERS["orcd"]
+    elif args.host:
+        host = args.host
+    else:
+        parser.print_help()
+        return
+    
+    # Load credentials
+    config = load_config()
+    username = config.get("username")
+    password = config.get("password")
+    
+    if not username or not password:
+        print("❌ Credentials not configured. Run: sshduo --config")
+        return
+    
+    ssh_duo(host, username, password)
+
+
+if __name__ == "__main__":
+    main()

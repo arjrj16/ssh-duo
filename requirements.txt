@@ -1,0 +1,2 @@
+# Duo Auto Sign-In Dependencies
+pexpect>=4.8.0
