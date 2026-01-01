@@ -1,3 +1,6 @@
+# ssh-duo
+im sick of duo auth
+
 # sshduo
 
 Quick SSH with automatic Duo SMS authentication for MIT servers.
